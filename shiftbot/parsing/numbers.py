@@ -1,25 +1,25 @@
 import re
-from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
 from shiftbot.parsing.text_utils import clean, fold
 
-_CURRENCIES = (
-    ("RUB", re.compile(r"₽|\bруб(?:лей|ля|\.)?\b|\brub\b")),
+_CURRENCIES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("RUB", re.compile(r"₽|\bруб(?:лей|ля|\.)?\b|\bр\.|\brub\b")),
     ("USD", re.compile(r"\$|\busd\b|\bдолл")),
     ("EUR", re.compile(r"€|\beur\b|\bевро\b")),
     ("KZT", re.compile(r"₸|\bkzt\b|\bтенге\b")),
+    ("UAH", re.compile(r"₴|\buah\b|\bгрн\b")),
+    ("BYN", re.compile(r"\bbyn\b|\bбел\.?\s?руб")),
+)
+
+_CURRENCY_NOISE_RE = re.compile(
+    r"₽|₸|₴|€|\$|\bруб(?:лей|ля|\.)?\b|\brub\b|\busd\b|\beur\b|\bkzt\b|\buah\b|\bbyn\b",
 )
 
 DEFAULT_CURRENCY = "RUB"
 
-_GROUP_SEP_RE = re.compile(r"(?<=\d)\s(?=\d{3}(?!\d))")
-_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
-_SIGNED_TERM_RE = re.compile(r"([+\-]?)\s*(\d+(?:\.\d+)?)")
-_PARENS_RE = re.compile(r"\(([^)]*)\)")
 
-
-def detect_currency(text):
+def detect_currency(text: str) -> str | None:
     lowered = fold(text)
     for code, pattern in _CURRENCIES:
         if pattern.search(lowered):
@@ -27,93 +27,63 @@ def detect_currency(text):
     return None
 
 
-def _prepare(text):
-    return _GROUP_SEP_RE.sub("", clean(text).lower())
+# space or apostrophe as a thousands separator: "15 000", "1'000"
+_GROUP_SEP_RE = re.compile("(?<=\\d)[   '’](?=\\d{3}(?!\\d))")
+
+_NUMBER_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*")
 
 
-def find_numbers(text):
-    out = []
-    for token in _NUMBER_RE.findall(_prepare(text)):
-        try:
-            out.append(Decimal(token.replace(",", ".")))
-        except InvalidOperation:
-            continue
-    return out
+def _normalize_groups(text: str) -> str:
+    previous = None
+    current = text
+    # "1 000 000" needs two passes
+    while previous != current:
+        previous = current
+        current = _GROUP_SEP_RE.sub("", current)
+    return current
 
 
-def parse_amount(text):
+def to_decimal(token: str) -> Decimal | None:
+    # whichever of . , comes last wins as the decimal point; a lone . before
+    # exactly three digits ("1.000") is a thousands separator
+    if "," in token and "." in token:
+        if token.rfind(",") > token.rfind("."):
+            token = token.replace(".", "").replace(",", ".")
+        else:
+            token = token.replace(",", "")
+    elif "," in token:
+        head, _, tail = token.rpartition(",")
+        if token.count(",") == 1 and 1 <= len(tail) <= 2:
+            token = f"{head}.{tail}"
+        else:
+            token = token.replace(",", "")
+    elif "." in token:
+        parts = token.split(".")
+        looks_grouped = len(parts) > 2 or (
+            len(parts) == 2 and len(parts[1]) == 3 and 1 <= len(parts[0]) <= 3
+        )
+        if looks_grouped:
+            token = "".join(parts)
+    try:
+        return Decimal(token)
+    except InvalidOperation:
+        return None
+
+
+def strip_noise(text: str) -> str:
+    return _normalize_groups(_CURRENCY_NOISE_RE.sub(" ", clean(text).lower()))
+
+
+def find_numbers(text: str) -> list[Decimal]:
+    prepared = strip_noise(text)
+    result: list[Decimal] = []
+    for token in _NUMBER_TOKEN_RE.findall(prepared):
+        value = to_decimal(token)
+        if value is not None:
+            result.append(value)
+    return result
+
+
+def parse_amount(text: str) -> Decimal | None:
     numbers = find_numbers(text)
     return numbers[0] if numbers else None
-
-
-@dataclass(frozen=True)
-class MoneyExpression:
-    amount: Decimal | None
-    terms: tuple = ()
-    computed: Decimal | None = None
-    stated: Decimal | None = None
-    transactions: int = 0
-    note: str | None = None
-    currency: str | None = None
-    mismatch: bool = False
-
-    @property
-    def is_empty(self):
-        return self.amount is None
-
-
-def parse_expression(text):
-    raw = clean(text)
-    if not raw:
-        return MoneyExpression(amount=None)
-
-    note = "; ".join(c.strip() for c in _PARENS_RE.findall(raw) if c.strip()) or None
-    prepared = _prepare(_PARENS_RE.sub(" ", raw)).replace(",", ".")
-
-    if "=" in prepared:
-        lhs, _, rhs = prepared.rpartition("=")
-    else:
-        lhs, rhs = prepared, ""
-
-    terms = []
-    for sign, token in _SIGNED_TERM_RE.findall(lhs):
-        try:
-            value = Decimal(token)
-        except InvalidOperation:
-            continue
-        terms.append(-value if sign == "-" else value)
-
-    computed = sum(terms) if terms else None
-    stated = parse_amount(rhs) if rhs.strip() else None
-    if computed is None and stated is None:
-        return MoneyExpression(amount=None, note=note)
-
-    amount = computed if computed is not None else stated
-    return MoneyExpression(
-        amount=amount,
-        terms=tuple(terms),
-        computed=computed,
-        stated=stated,
-        transactions=sum(1 for t in terms if t > 0),
-        note=note,
-        currency=detect_currency(raw),
-        mismatch=computed is not None and stated is not None and computed != stated,
-    )
-
-
-_EXTRA_KINDS = (
-    ("taxi", ("такси", "поездк")),
-    ("transfer", ("перевод",)),
-    ("debt", ("долг", "остаток")),
-    ("expense", ("расход", "покупк", "оплат")),
-)
-
-
-def classify_extra(text):
-    lowered = fold(text)
-    kind = "note"
-    for candidate, markers in _EXTRA_KINDS:
-        if any(marker in lowered for marker in markers):
-            kind = candidate
-            break
-    return kind, parse_expression(text).amount, clean(text)
