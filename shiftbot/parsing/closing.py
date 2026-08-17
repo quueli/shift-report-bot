@@ -7,7 +7,7 @@ from shiftbot.domain.models import ExtraEntry, Issue, IssueLevel, WorkerShift
 from shiftbot.parsing.expressions import classify_extra, parse_expression
 from shiftbot.parsing.labels import Field, match_label, value_fits
 from shiftbot.parsing.names import is_name_line
-from shiftbot.parsing.text_utils import clean, clean_name
+from shiftbot.parsing.text_utils import clean, clean_name, has_digit, has_letter
 from shiftbot.parsing.times import parse_time
 
 WORKER_FIELDS = (Field.SHIFT_START, Field.SHIFT_END, Field.AMOUNT)
@@ -34,6 +34,35 @@ class _Draft:
         if fld is Field.SHIFT_END:
             return self.end_seen
         return self.amount_seen
+
+
+def _join_wrapped_math(body: Iterable[str]) -> list[str]:
+    # a long sum typed on a phone wraps: "6000+6000+12000" then "+4000=34 000".
+    # glue the tail back on, but only when it is pure arithmetic and follows
+    # immediately - "-100" after a blank line is a note, not part of the sum
+    joined: list[str] = []
+    previous_blank = True
+    for raw in body:
+        stripped = raw.strip()
+        if not stripped:
+            previous_blank = True
+            joined.append(raw)
+            continue
+        previous = joined[-1].rstrip() if joined else ""
+        is_tail = (
+            not previous_blank
+            and previous
+            and not has_letter(stripped)
+            and has_digit(stripped)
+            and has_digit(previous)
+            and (stripped[:1] in {"+", "-", "="} or previous[-1:] in {"+", "-", "="})
+        )
+        if is_tail:
+            joined[-1] = f"{previous}{stripped}"
+        else:
+            joined.append(raw)
+        previous_blank = False
+    return joined
 
 
 def parse_closing(
@@ -123,7 +152,7 @@ def parse_closing(
         elif value:
             extras.append(ExtraEntry("note", None, f"{fld.value}: {value}"))
 
-    for raw_line in body:
+    for raw_line in _join_wrapped_math(body):
         line = clean(raw_line)
         if not line:
             continue  # a blank line does not clear pending
@@ -147,10 +176,13 @@ def parse_closing(
                 pending = fld
             continue
 
-        if pending is not None and value_fits(pending, line):
-            assign(pending, line)
+        if pending is not None:
+            if value_fits(pending, line):
+                assign(pending, line)
+                pending = None
+                continue
+            assign(pending, "")
             pending = None
-            continue
 
         if is_name_line(line):
             if current is not None and current.name is None:
