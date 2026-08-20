@@ -1,5 +1,7 @@
 # shift-report-bot
 
-people post shift reports into a telegram chat as free text.
+people post shift reports into a telegram chat as free text. this turns them into numbers.
 
-not done
+    python -m examples.parse_report   # parses examples/sample_reports.txt, stdlib only
+    pip install pytest && pytest
+
